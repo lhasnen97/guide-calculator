@@ -1,0 +1,7 @@
+# Only the script and README are published; everything else stays local.
+/*
+!/.gitignore
+!/README.md
+!/versions/
+/versions/*
+!/versions/GuideCalculator.py
