@@ -514,9 +514,9 @@ def parse_size_args(argv):
 
 # ── sending guides to Resolve ─────────────────────────────────────────────────
 
-# Send guides and Clear drive Resolve's menus with AppleScript and macOS mouse
-# events. Windows would need UI Automation instead, which isn't built yet.
-SEND_SUPPORTED = sys.platform == "darwin"
+# Send guides and Clear drive Resolve's menus: AppleScript plus macOS mouse
+# events on macOS, a PowerShell UI Automation script (WIN_SEND_PS) on Windows.
+SEND_SUPPORTED = sys.platform == "darwin" or sys.platform.startswith("win")
 # The scripting API has no access to viewer guides, but Resolve's View > Guides
 # menu has Add Guide… and Clear All Guides. These helpers drive that menu and
 # the Add Guide dialog through macOS accessibility (System Events) plus one
@@ -748,8 +748,338 @@ def _parse_location(text):
     return int(idx), float(x), float(y), where
 
 
+# ── Windows: the same steps through UI Automation ──
+# Runs as one PowerShell process per send. It reads the plan as JSON on stdin
+# and prints OK, or ERR:<message>. Same safeguards as macOS: one real click to
+# open the Position box, values read back and retried, nothing typed unless
+# Resolve is in front, and the dialog cancelled rather than adding a guide in
+# the wrong place.
+WIN_SEND_PS = r'''# Guide Calculator: add or clear guides in DaVinci Resolve's viewer on Windows.
+# Reads a JSON plan on stdin: {"clear": "<menu item or empty>", "guides": [{"v": "-480", "o": "Vertical"}, ...]}
+# Prints "OK" when done, or "ERR:<message>" and exits 1.
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class GcNative {
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+}
+"@
+# Per-monitor DPI awareness, so UI Automation rectangles and mouse positions agree
+if (-not [GcNative]::SetProcessDpiAwarenessContext([IntPtr]::new(-4))) { [void][GcNative]::SetProcessDPIAware() }
+
+$AE = [System.Windows.Automation.AutomationElement]
+$TS = [System.Windows.Automation.TreeScope]
+$CT = [System.Windows.Automation.ControlType]
+
+function Say($msg) { [Console]::Out.WriteLine($msg); [Console]::Out.Flush() }
+function Fail($msg) { Say "ERR:$msg"; exit 1 }
+
+$plan = [Console]::In.ReadToEnd() | ConvertFrom-Json
+
+$proc = Get-Process -Name Resolve -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+if (-not $proc) { Fail "Couldn't find DaVinci Resolve. Is it open?" }
+$rpid = $proc.Id
+$mainHwnd = $proc.MainWindowHandle
+$main = $AE::FromHandle($mainHwnd)
+
+# ── helpers ──
+
+function Resolve-IsFront {
+    $fpid = [uint32]0
+    [void][GcNative]::GetWindowThreadProcessId([GcNative]::GetForegroundWindow(), [ref]$fpid)
+    return $fpid -eq $rpid
+}
+
+function Focus-Resolve {
+    $fg = [GcNative]::GetForegroundWindow()
+    $dummy = [uint32]0
+    $fgThread = [GcNative]::GetWindowThreadProcessId($fg, [ref]$dummy)
+    $me = [GcNative]::GetCurrentThreadId()
+    $attached = $false
+    if ($fgThread -ne 0 -and $fgThread -ne $me) { $attached = [GcNative]::AttachThreadInput($me, $fgThread, $true) }
+    if ([GcNative]::IsIconic($mainHwnd)) { [void][GcNative]::ShowWindow($mainHwnd, 9) }
+    [void][GcNative]::BringWindowToTop($mainHwnd)
+    [void][GcNative]::SetForegroundWindow($mainHwnd)
+    if ($attached) { [void][GcNative]::AttachThreadInput($me, $fgThread, $false) }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Resolve-IsFront) -and $sw.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 30 }
+}
+
+function Name-Matches($el, $name, $prefix) {
+    $n = $el.Current.Name
+    if ($prefix) { return $n -like "$name*" }
+    return $n -eq $name
+}
+
+# Small windows Resolve has open besides its main window: menus and dialogs
+function Resolve-Popups {
+    $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $rpid)
+    $wins = @($AE::RootElement.FindAll($TS::Children, $cond))
+    # Qt dialogs can also appear as direct children of the main window
+    $wcond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Window)
+    $wins += @($main.FindAll($TS::Children, $wcond))
+    $wins | Where-Object { $_.Current.NativeWindowHandle -ne [int]$mainHwnd }
+}
+
+function Find-Under($root, $ctype, $name, $prefix) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $ctype)
+    foreach ($el in $root.FindAll($TS::Descendants, $cond)) {
+        if (Name-Matches $el $name $prefix) { return $el }
+    }
+    return $null
+}
+
+function Wait-InPopups($ctype, $name, $prefix, $timeoutMs) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        foreach ($w in Resolve-Popups) {
+            if ($ctype -eq $CT::Window -and (Name-Matches $w $name $prefix)) { return $w }
+            $el = Find-Under $w $ctype $name $prefix
+            if ($el) { return $el }
+        }
+        Start-Sleep -Milliseconds 40
+    } while ($sw.ElapsedMilliseconds -lt $timeoutMs)
+    return $null
+}
+
+function Click-At($x, $y) {
+    $orig = New-Object GcNative+POINT
+    [void][GcNative]::GetCursorPos([ref]$orig)
+    [void][GcNative]::SetCursorPos([int]$x, [int]$y)
+    Start-Sleep -Milliseconds 20
+    [GcNative]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)   # left down
+    Start-Sleep -Milliseconds 20
+    [GcNative]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)   # left up
+    Start-Sleep -Milliseconds 30
+    [void][GcNative]::SetCursorPos($orig.X, $orig.Y)
+}
+
+function Click-Element($el) {
+    $r = $el.Current.BoundingRectangle
+    if ($r.IsEmpty) { throw "no on-screen position for '$($el.Current.Name)'" }
+    Click-At ($r.X + $r.Width / 2) ($r.Y + $r.Height / 2)
+}
+
+function Get-Pattern($el, $pattern) {
+    $p = $null
+    if ($el.TryGetCurrentPattern($pattern, [ref]$p)) { return $p }
+    return $null
+}
+
+# Open a menu item that has a submenu
+function Open-Item($el) {
+    $p = Get-Pattern $el ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($p) { $p.Expand(); return }
+    $p = Get-Pattern $el ([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($p) { $p.Invoke(); return }
+    Click-Element $el
+}
+
+# Press a button, menu command or radio button
+function Press($el) {
+    $p = Get-Pattern $el ([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($p) { $p.Invoke(); return }
+    $p = Get-Pattern $el ([System.Windows.Automation.SelectionItemPattern]::Pattern)
+    if ($p) { $p.Select(); return }
+    $p = Get-Pattern $el ([System.Windows.Automation.TogglePattern]::Pattern)
+    if ($p) { $p.Toggle(); return }
+    Click-Element $el
+}
+
+# Make sure a toggle-style control (Pixels, an orientation) is on
+function Turn-On($el) {
+    $p = Get-Pattern $el ([System.Windows.Automation.SelectionItemPattern]::Pattern)
+    if ($p) { if (-not $p.Current.IsSelected) { $p.Select() }; return }
+    $p = Get-Pattern $el ([System.Windows.Automation.TogglePattern]::Pattern)
+    if ($p) { if ($p.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) { $p.Toggle() }; return }
+    Press $el
+}
+
+function Close-Menus {
+    if (Resolve-IsFront) { [System.Windows.Forms.SendKeys]::SendWait("{ESC}{ESC}{ESC}") }
+}
+
+$script:menuBar = $null
+function Get-MenuBar {
+    if (-not $script:menuBar) {
+        $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::MenuBar)
+        $script:menuBar = $main.FindFirst($TS::Descendants, $cond)
+        if (-not $script:menuBar) { Fail "Couldn't find Resolve's menu bar." }
+    }
+    return $script:menuBar
+}
+
+# View › Guides › <item>. Items that open a dialog get a real click: a UI
+# Automation Invoke can block until Resolve's modal dialog closes.
+function Invoke-GuidesItem($itemName, $click) {
+    $view = Find-Under (Get-MenuBar) $CT::MenuItem "View" $false
+    if (-not $view) { Fail "Couldn't find Resolve's View menu." }
+    Open-Item $view
+    $guides = Wait-InPopups $CT::MenuItem "Guides" $false 2000
+    if (-not $guides) { Close-Menus; Fail "Couldn't open View > Guides." }
+    Open-Item $guides
+    $item = Wait-InPopups $CT::MenuItem $itemName $true 2000
+    if (-not $item) { Close-Menus; Fail "Couldn't find View > Guides > $itemName." }
+    if (-not $item.Current.IsEnabled) { Close-Menus; Fail "View > Guides is unavailable. Show a timeline in Resolve's viewer first." }
+    if ($click) { Click-Element $item } else { Press $item }
+}
+
+function Get-Dialog($timeoutMs) { Wait-InPopups $CT::Window "Add Guide" $false $timeoutMs }
+
+function Wait-DialogClosed {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 3000) {
+        if (-not (Get-Dialog 0)) { return $true }
+        Start-Sleep -Milliseconds 40
+    }
+    return $false
+}
+
+# Resolve's Position box is a click-to-edit number exposed as text
+function Get-PositionField($dialog) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Text)
+    foreach ($el in $dialog.FindAll($TS::Descendants, $cond)) {
+        $d = 0.0
+        $n = $el.Current.Name -replace [char]0x2212, '-'
+        if ([double]::TryParse($n, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $el }
+    }
+    return $null
+}
+
+function Same-Number($text, $value) {
+    $a = 0.0; $b = 0.0
+    $t = "$text" -replace [char]0x2212, '-'
+    if (-not [double]::TryParse($t, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$a)) { return $false }
+    [void][double]::TryParse($value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$b)
+    return [Math]::Abs($a - $b) -lt 0.51
+}
+
+function Cancel-Dialog {
+    $dlg = Get-Dialog 0
+    if ($dlg) {
+        $cancel = Find-Under $dlg $CT::Button "Cancel" $false
+        if ($cancel) { Press $cancel } else { [System.Windows.Forms.SendKeys]::SendWait("{ESC}") }
+    }
+}
+
+function Add-Guide($value, $orientation) {
+    Invoke-GuidesItem "Add Guide" $true
+    $dlg = Get-Dialog 3000
+    if (-not $dlg) { Fail "Resolve's Add Guide dialog didn't open." }
+    $pixels = Find-Under $dlg $CT::Button "Pixels" $false
+    if (-not $pixels) { $pixels = Find-Under $dlg $CT::CheckBox "Pixels" $false }
+    if (-not $pixels) { $pixels = Find-Under $dlg $CT::RadioButton "Pixels" $false }
+    if ($pixels) { Turn-On $pixels }
+
+    $typed = ""
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        if (-not (Resolve-IsFront)) { Focus-Resolve }
+        if (-not (Resolve-IsFront)) { continue }   # never type into another app
+        $field = Get-PositionField $dlg
+        if (-not $field) { Cancel-Dialog; Fail "Couldn't find the Position field in Resolve's Add Guide dialog." }
+        Click-Element $field
+        Start-Sleep -Milliseconds 80
+        if (-not (Resolve-IsFront)) { continue }
+        [System.Windows.Forms.SendKeys]::SendWait("^a")
+        [System.Windows.Forms.SendKeys]::SendWait($value)
+        [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Milliseconds 30
+            $f = Get-PositionField $dlg
+            if ($f) { $typed = $f.Current.Name; if (Same-Number $typed $value) { break } }
+        }
+        if (Same-Number $typed $value) { break }
+    }
+    if (-not (Same-Number $typed $value)) {
+        Cancel-Dialog
+        Fail "Resolve's Position box didn't take $value (it shows '$typed'). Cancelled so no guide lands in the wrong place."
+    }
+
+    $radio = Find-Under $dlg $CT::RadioButton $orientation $false
+    if (-not $radio) { Cancel-Dialog; Fail "Couldn't find the $orientation option in Resolve's Add Guide dialog." }
+    Turn-On $radio
+    $add = Find-Under $dlg $CT::Button "Add" $false
+    if (-not $add) { Cancel-Dialog; Fail "Couldn't find the Add button in Resolve's Add Guide dialog." }
+    Press $add
+    if (-not (Wait-DialogClosed)) { Fail "Resolve didn't accept the guide at $value." }
+}
+
+# ── run the plan ──
+try {
+    Focus-Resolve
+    if (-not (Resolve-IsFront)) { Fail "Couldn't bring DaVinci Resolve to the front." }
+    if ($plan.clear) { Invoke-GuidesItem $plan.clear $false; Start-Sleep -Milliseconds 150 }
+    foreach ($g in @($plan.guides)) { Add-Guide ([string]$g.v) ([string]$g.o) }
+    Say "OK"
+    exit 0
+} catch {
+    Cancel-Dialog
+    Close-Menus
+    Fail "$($_.Exception.Message)"
+}
+'''
+
+
+def run_windows_send(clear_item, guides):
+    """Clear (if clear_item names a View > Guides command) and add guides,
+    given as [(value, "Vertical" | "Horizontal"), ...]."""
+    import tempfile
+    plan = json.dumps({"clear": clear_item or "",
+                       "guides": [{"v": f"{v:g}", "o": o} for v, o in guides]})
+    # BOM so Windows PowerShell 5.1 reads the script as UTF-8
+    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8-sig") as f:
+        f.write(WIN_SEND_PS)
+        script = f.name
+    try:
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)  # let PowerShell focus Resolve
+        except Exception:
+            pass
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-ExecutionPolicy", "Bypass", "-File", script],
+                           input=plan, capture_output=True, text=True,
+                           timeout=60 + 4 * len(guides), creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise AutomationError("Resolve didn't respond in time.")
+    except OSError as e:
+        raise AutomationError(f"Couldn't run PowerShell: {e}")
+    finally:
+        try:
+            os.unlink(script)
+        except OSError:
+            pass
+    lines = (r.stdout or "").splitlines()
+    for line in lines:
+        if line.startswith("ERR:"):
+            raise AutomationError(line[4:].strip())
+    if r.returncode != 0 or "OK" not in lines:
+        err = [l for l in (r.stderr or "").splitlines() if l.strip()]
+        # PowerShell puts the message first, then where it happened
+        raise AutomationError(err[0][:300] if err else "PowerShell stopped without finishing.")
+
+
 def clear_resolve_guides(axes="both"):
     """Clear Resolve's guides: "both", or only vertical ("x") / horizontal ("y")."""
+    if IS_WIN:
+        run_windows_send(CLEAR_ITEMS[axes], [])
+        return
     run_applescript(AS_ACTIVATE + AS_CLEAR.replace("__CLEAR_ITEM__", CLEAR_ITEMS[axes]))
 
 
@@ -764,10 +1094,13 @@ def send_guides_to_resolve(gx, gy, clear_first=True, clear_axes="both", attempts
     looked up again whenever it opens somewhere else. Nothing is typed
     unless Resolve is frontmost, a value that doesn't take is retried, and
     the dialog is cancelled rather than adding a guide in the wrong place."""
+    guides = [(v, "Vertical") for v in gx] + [(v, "Horizontal") for v in gy]
+    if IS_WIN:
+        run_windows_send(CLEAR_ITEMS[clear_axes] if clear_first else "", guides)
+        return
     if not accessibility_trusted():
         raise AutomationError("macOS needs to allow this app to control Resolve.",
                               needs_permission=True)
-    guides = [(v, "Vertical") for v in gx] + [(v, "Horizontal") for v in gy]
     clear = AS_CLEAR.replace("__CLEAR_ITEM__", CLEAR_ITEMS[clear_axes])
     start = AS_ACTIVATE + (clear if clear_first else "")
     if not guides:
@@ -1568,7 +1901,7 @@ class GuideCalculator(QWidget):
             self.send_btn.setEnabled(False)
             self.clear_btn.setEnabled(False)
             self.replace_check.hide()
-            note = QLabel("Sending guides to Resolve is macOS-only for now. Copy the "
+            note = QLabel("Sending guides to Resolve works on macOS and Windows. Copy the "
                           "values and add them with View › Guides › Add Guide.")
             note.setObjectName("dim")
             note.setWordWrap(True)
@@ -1954,8 +2287,25 @@ def bring_app_to_front(win):
     behind Resolve. On Windows the launcher allowed this process to take the
     foreground, so ask for it directly."""
     if sys.platform.startswith("win"):
+        # Windows only lets the foreground app hand over focus. Briefly attach
+        # to its input queue so SetForegroundWindow is allowed.
         try:
-            ctypes.windll.user32.SetForegroundWindow(int(win.winId()))
+            user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+            user32.GetForegroundWindow.restype = ctypes.c_void_p
+            user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            for fn in (user32.SetForegroundWindow, user32.BringWindowToTop, user32.IsIconic):
+                fn.argtypes = [ctypes.c_void_p]
+            user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            hwnd = int(win.winId())
+            fg_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+            me = kernel32.GetCurrentThreadId()
+            attached = bool(fg_thread and fg_thread != me and user32.AttachThreadInput(me, fg_thread, True))
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            if attached:
+                user32.AttachThreadInput(me, fg_thread, False)
         except Exception:
             pass
         return

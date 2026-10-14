@@ -29,7 +29,6 @@ The first time, the script downloads the Qt libraries its window needs (PySide6,
 
 - macOS 13 or later, or Windows 10 or 11 (64-bit)
 - DaVinci Resolve 21.1 or later. Older versions don't ship their own Python, so they need Python 3 with PySide6 installed (`pip install PySide6`).
-- **Send guides** and **Clear** are macOS-only for now. On Windows, copy the values and add them with View › Guides › Add Guide.
 - An internet connection for the first run
 
 Built and tested on DaVinci Resolve Studio 21.1 for macOS. The Windows version is new and hasn't been tested on a Windows PC yet. See [Free vs Studio](#free-vs-studio).
@@ -43,9 +42,9 @@ Built and tested on DaVinci Resolve Studio 21.1 for macOS. The Windows version i
 - **Copy**: any single value, one axis, or everything as text, JSON, CSV or a numbered list.
 - **Presets**: 1080p, UHD, DCI 4K, 720p, 6K, 2.39:1 scope and Instagram 4:5 and 1:1. Save your own sizes and they stay for next time (`~/.guidecalc/presets.json`).
 
-## Send guides to Resolve (macOS)
+## Send guides to Resolve
 
-Resolve's scripting API has no functions for viewer guides, so **Send guides** uses the menu the way you would:
+Resolve's scripting API has no functions for viewer guides, so **Send guides** uses the menu the way you would (through AppleScript on macOS and UI Automation in PowerShell on Windows):
 
 1. Clears the guides you're replacing (only the axis you picked, when *Replace existing guides* is on).
 2. Opens **View › Guides › Add Guide…** and switches it to pixels.
@@ -54,7 +53,7 @@ Resolve's scripting API has no functions for viewer guides, so **Send guides** u
 
 **Clear** runs Clear All Guides, or Clear All Vertical/Horizontal Guides when only one axis is selected.
 
-It takes a little over a second per guide, so a 4 × 3 grid (five guides) takes about eight seconds. Keep your hands off the mouse and keyboard while it runs. When it's done, the calculator comes back to the front so you can adjust and send again. The first time, macOS asks you to allow control under **System Settings › Privacy & Security › Accessibility**.
+It takes a little over a second per guide, so a 4 × 3 grid (five guides) takes about eight seconds. Keep your hands off the mouse and keyboard while it runs. When it's done, the calculator comes back to the front so you can adjust and send again. The first time on macOS, it asks you to allow control under **System Settings › Privacy & Security › Accessibility**. Windows doesn't ask, but if Resolve runs as administrator, the calculator has to as well, or Windows blocks the clicks and typing.
 
 ## Free vs Studio
 
