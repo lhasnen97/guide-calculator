@@ -13,7 +13,7 @@ Every value is measured from the center of the frame with +Y up, the same way Re
    ```bash
    cp ~/Downloads/GuideCalculator.py ~/Library/Application\ Support/Blackmagic\ Design/DaVinci\ Resolve/Fusion/Scripts/Utility/
    ```
-   **Windows** (PowerShell):
+   **Windows** (beta, PowerShell):
    ```powershell
    $dir = "$env:APPDATA\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility"
    New-Item -ItemType Directory -Force $dir | Out-Null
@@ -27,11 +27,11 @@ The first time, the script downloads the Qt libraries its window needs (PySide6,
 
 ### Requirements
 
-- macOS 13 or later, or Windows 10 or 11 (64-bit)
+- macOS 13 or later, or Windows 10 or 11 (64-bit, beta)
 - DaVinci Resolve 21.1 or later. Older versions don't ship their own Python, so they need Python 3 with PySide6 installed (`pip install PySide6`).
 - An internet connection for the first run
 
-Built and tested on DaVinci Resolve Studio 21.1 for macOS. The Windows version is new and hasn't been tested on a Windows PC yet. See [Free vs Studio](#free-vs-studio).
+Built and tested on DaVinci Resolve Studio 21.1 for macOS. **Windows support is in beta:** it hasn't been tested on a Windows PC yet, so if something doesn't work, please [open an issue](https://github.com/lhasnen97/guide-calculator/issues) with what the status bar says. See [Free vs Studio](#free-vs-studio).
 
 ## What it does
 
