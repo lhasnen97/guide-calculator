@@ -5,16 +5,19 @@
 # styled like Resolve's viewer (rulers, +Y up, 1px guides, safe-area outlines),
 # with presets and copy/export.
 #
-# Note: DaVinci Resolve 20 removed guide placement from the scripting API.
-# This tool calculates positions only — guides must be placed manually.
+# Resolve's scripting API has no functions for viewer guides, so on macOS
+# "Send guides" adds them through View > Guides > Add Guide instead.
 #
-# Install: ~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/
+# Install (macOS):   ~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/
+# Install (Windows): %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\
 # Run via: Workspace > Scripts > GuideCalculator
 #
 # Resolve 21.1 runs Scripts-menu scripts in its own Python, which has no
 # PySide6, and Resolve's own Qt 5 would clash with PySide6's Qt 6 anyway.
 # So when launched from Resolve, this script reads the resolution there and
-# re-opens itself in a separate system Python that has PySide6 installed.
+# re-opens itself in a separate process: a system Python with PySide6 if
+# there is one, otherwise Resolve's own Python with a private PySide6 that it
+# downloads on first run.
 
 import ctypes
 import math
@@ -55,8 +58,10 @@ except ImportError:
 # ── Resolve API helpers ───────────────────────────────────────────────────────
 
 RESOLVE_MODULES_DIR = (
-    "/Library/Application Support/Blackmagic Design/DaVinci Resolve/"
-    "Developer/Scripting/Modules"
+    os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
+                 "Blackmagic Design", "DaVinci Resolve", "Support", "Developer", "Scripting", "Modules")
+    if sys.platform.startswith("win") else
+    "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"
 )
 
 
@@ -119,29 +124,47 @@ def get_timeline_size():
 
 # ── launching from Resolve ────────────────────────────────────────────────────
 
-PYTHON_CANDIDATES = [
+IS_WIN = sys.platform.startswith("win")
+NO_WINDOW = 0x08000000 if IS_WIN else 0   # CREATE_NO_WINDOW: no console flash
+
+if IS_WIN:
+    _APPDATA = os.environ.get("APPDATA", str(Path.home() / "AppData/Roaming"))
+    _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))
+    _PROGRAMDATA = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+    _PROGRAMFILES = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    SCRIPT_DIRS = [
+        Path(_APPDATA) / "Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts/Utility",
+        Path(_PROGRAMDATA) / "Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility",
+    ]
+    RESOLVE_PYTHON = str(Path(_PROGRAMFILES) / "Blackmagic Design/DaVinci Resolve/ResolvePython/ResolvePython.exe")
+    DATA_DIR = Path(_LOCALAPPDATA) / "GuideCalculator"
+    LOG_FILE = DATA_DIR / "GuideCalculator.log"
+else:
+    SCRIPT_DIRS = [
+        Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility",
+        Path("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"),
+    ]
+    # Resolve 21.1+ ships its own Python. With a private copy of PySide6 it
+    # can run the window, so a computer without Python + PySide6 still works.
+    RESOLVE_PYTHON = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Applications/ResolvePython"
+    DATA_DIR = Path.home() / "Library/Application Support/GuideCalculator"
+    LOG_FILE = Path.home() / "Library/Logs/GuideCalculator.log"
+
+MAC_PYTHON_CANDIDATES = [
     "/usr/local/bin/python3",
     "/opt/homebrew/bin/python3",
     "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
     "/usr/bin/python3",
 ]
 
-SCRIPT_DIRS = [
-    Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility",
-    Path("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"),
-]
-
-# Resolve 21.1+ ships its own Python. With a private copy of PySide6 it can
-# run the window, so a Mac without a system Python + PySide6 still works.
-RESOLVE_PYTHON = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Applications/ResolvePython"
 QT_VERSION = "6.10.2"
-QT_LIB_DIR = Path.home() / "Library/Application Support/GuideCalculator" / f"PySide6-{QT_VERSION}"
+QT_LIB_DIR = DATA_DIR / f"PySide6-{QT_VERSION}"
 QT_READY_MARKER = QT_LIB_DIR / ".complete"
 QT_LIB_ENV = "GUIDECALC_QT_LIB"
-# A tiny app bundle whose executable is a link to Resolve's Python. macOS only
-# lets bundled apps bring their window to the front, and it also gives the
-# window its own name in the menu bar.
-APP_BUNDLE = QT_LIB_DIR.parent / "Guide Calculator.app"
+# macOS only: a tiny app bundle whose executable is a link to Resolve's
+# Python. macOS only lets bundled apps bring their window to the front, and it
+# also gives the window its own name in the menu bar.
+APP_BUNDLE = DATA_DIR / "Guide Calculator.app"
 APP_EXEC = APP_BUNDLE / "Contents/MacOS/GuideCalculator"
 APP_INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -153,20 +176,52 @@ APP_INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 """
-LOG_FILE = Path.home() / "Library/Logs/GuideCalculator.log"
 
-# Pinned PySide6 wheels from PyPI (macOS 13+, universal2), checked by SHA-256.
-QT_WHEELS = [
-    ("shiboken6-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
-     "https://files.pythonhosted.org/packages/fb/38/3912eb08a3b865b5fcdb4bdce8076cacc211986cee587f5cb62e637791af/shiboken6-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
-     "3bd4e94e9a3c8c1fa8362fd752d399ef39265d5264e4e37bae61cdaa2a00c8c7"),
-    ("pyside6-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
-     "https://files.pythonhosted.org/packages/35/0f/5736889fc850794623692cb369e295a994175e51295fa52134626f486296/pyside6-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
-     "4b084293caa7845d0064aaf6af258e0f7caae03a14a33537d0a552131afddaf0"),
-    ("pyside6_essentials-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
-     "https://files.pythonhosted.org/packages/1d/2e/5f18a77f5e0bd730bacec93a690d0ef3c96a9711d213653eacecbf241b8d/pyside6_essentials-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
-     "1dee2cb9803ff135f881dadeb5c0edcef793d1ec4f8a9140a1348cecb71074e1"),
-]
+# Pinned PySide6 wheels from PyPI, checked by SHA-256. One set per platform.
+_PYPI = "https://files.pythonhosted.org/packages/"
+QT_WHEELS = {
+    "macos": [
+        ("shiboken6-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
+         _PYPI + "fb/38/3912eb08a3b865b5fcdb4bdce8076cacc211986cee587f5cb62e637791af/shiboken6-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
+         "3bd4e94e9a3c8c1fa8362fd752d399ef39265d5264e4e37bae61cdaa2a00c8c7"),
+        ("pyside6-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
+         _PYPI + "35/0f/5736889fc850794623692cb369e295a994175e51295fa52134626f486296/pyside6-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
+         "4b084293caa7845d0064aaf6af258e0f7caae03a14a33537d0a552131afddaf0"),
+        ("pyside6_essentials-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
+         _PYPI + "1d/2e/5f18a77f5e0bd730bacec93a690d0ef3c96a9711d213653eacecbf241b8d/pyside6_essentials-6.10.2-cp39-abi3-macosx_13_0_universal2.whl",
+         "1dee2cb9803ff135f881dadeb5c0edcef793d1ec4f8a9140a1348cecb71074e1"),
+    ],
+    "win_amd64": [
+        ("shiboken6-6.10.2-cp39-abi3-win_amd64.whl",
+         _PYPI + "71/5d/5ca52c0ef86b3d01572131b6709bd531a080995f7e680720e9424328ce1d/shiboken6-6.10.2-cp39-abi3-win_amd64.whl",
+         "10f3c8c5e1b8bee779346f21c10dbc14cff068f0b0b4e62420c82a6bf36ac2e7"),
+        ("pyside6-6.10.2-cp39-abi3-win_amd64.whl",
+         _PYPI + "4f/d4/673b8112b4a260377f760be835c4e357163fdaf68a56a1aec59aeb8e584b/pyside6-6.10.2-cp39-abi3-win_amd64.whl",
+         "032bad6b18a17fcbf4dddd0397f49b07f8aae7f1a45b7e4de7037bf7fd6e0edf"),
+        ("pyside6_essentials-6.10.2-cp39-abi3-win_amd64.whl",
+         _PYPI + "22/a8/616bbbd009efd3e17bf9a2db09d90c6764c010565cd2bdea2a240bfd18f7/pyside6_essentials-6.10.2-cp39-abi3-win_amd64.whl",
+         "0741018c2b6395038cad4c41775cfae3f13a409e87995ac9f7d89e5b1fb6b22a"),
+    ],
+    "win_arm64": [
+        ("shiboken6-6.10.2-cp39-abi3-win_arm64.whl",
+         _PYPI + "46/52/421fd378313c89b67ee7d584bf4e9ec088fa1804891b8d74e02b16703457/shiboken6-6.10.2-cp39-abi3-win_arm64.whl",
+         "20c671645d70835af212ee05df60361d734c5305edb2746e9875c6a31283f963"),
+        ("pyside6-6.10.2-cp39-abi3-win_arm64.whl",
+         _PYPI + "14/95/bda648fcccf61fe58cb417284716ae30acdddd44f7d4cbad6eea4ccaa872/pyside6-6.10.2-cp39-abi3-win_arm64.whl",
+         "65a59ad0bc92525639e3268d590948ce07a80ee97b55e7a9200db41d493cac31"),
+        ("pyside6_essentials-6.10.2-cp39-abi3-win_arm64.whl",
+         _PYPI + "b9/f9/c9757a984c4ffb6d12fab69e966d95dfc862a5d44e12b7900f3a03780b76/pyside6_essentials-6.10.2-cp39-abi3-win_arm64.whl",
+         "db5f4913648bb6afddb8b347edae151ee2378f12bceb03c8b2515a530a4b38d9"),
+    ],
+}
+
+
+def qt_wheels():
+    """The wheel set for this platform and processor."""
+    if not IS_WIN:
+        return QT_WHEELS["macos"]
+    import platform
+    return QT_WHEELS["win_arm64" if platform.machine().upper() == "ARM64" else "win_amd64"]
 
 
 def find_script_path():
@@ -181,41 +236,74 @@ def find_script_path():
     return None
 
 
+def _python_candidates():
+    """Commands that might start a system Python, most likely first."""
+    if not IS_WIN:
+        return [[p] for p in MAC_PYTHON_CANDIDATES if os.path.exists(p)]
+    import glob
+    import shutil
+    cands = []
+    if shutil.which("py"):
+        cands.append([shutil.which("py"), "-3"])
+    on_path = shutil.which("python")
+    # skip the Microsoft Store placeholder, which can open the Store
+    if on_path and "WindowsApps" not in on_path:
+        cands.append([on_path])
+    for pattern in (os.path.join(_LOCALAPPDATA, "Programs", "Python", "Python3*", "python.exe"),
+                    os.path.join(_PROGRAMFILES, "Python3*", "python.exe")):
+        cands += [[p] for p in sorted(glob.glob(pattern), reverse=True)]
+    return cands
+
+
 def find_qt_python():
-    """First system Python that can import PySide6, or None."""
-    for py in PYTHON_CANDIDATES:
-        if not os.path.exists(py):
-            continue
+    """A system Python that can import PySide6, or None. On Windows this
+    returns pythonw.exe when it exists, so no console window opens."""
+    for cmd in _python_candidates():
         try:
-            ok = subprocess.run([py, "-c", "import PySide6"],
-                                capture_output=True, timeout=15).returncode == 0
+            r = subprocess.run(cmd + ["-c", "import PySide6, sys; print(sys.executable)"],
+                               capture_output=True, text=True, timeout=15,
+                               creationflags=NO_WINDOW)
         except Exception:
-            ok = False
-        if ok:
-            return py
+            continue
+        exe = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
+        if exe and os.path.exists(exe):
+            if IS_WIN:
+                quiet = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                return quiet if os.path.exists(quiet) else exe
+            return exe
     return None
 
 
 def log(msg):
     """Print (shows in Resolve's console when run there) and append to
-    ~/Library/Logs/GuideCalculator.log, since the window's process has no
-    terminal."""
+    LOG_FILE, since the window's process has no terminal."""
     print(f"GuideCalculator: {msg}")
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_FILE, "a") as f:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
     except OSError:
         pass
 
 
 def notify(msg):
-    """macOS notification, best effort."""
-    safe = msg.replace("\\", "").replace('"', "'")
+    """Desktop notification, best effort."""
     try:
-        subprocess.run(["osascript", "-e",
-                        f'display notification "{safe}" with title "Guide Calculator"'],
-                       capture_output=True, timeout=10)
+        if IS_WIN:
+            text = msg.replace("'", "''")
+            ps = ("Add-Type -AssemblyName System.Windows.Forms; "
+                  "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                  "$n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; "
+                  f"$n.ShowBalloonTip(6000, 'Guide Calculator', '{text}', "
+                  "[System.Windows.Forms.ToolTipIcon]::Info); Start-Sleep 7; $n.Dispose()")
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                             creationflags=NO_WINDOW,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            safe = msg.replace("\\", "").replace('"', "'")
+            subprocess.run(["osascript", "-e",
+                            f'display notification "{safe}" with title "Guide Calculator"'],
+                           capture_output=True, timeout=10)
     except Exception:
         pass
 
@@ -230,9 +318,28 @@ def child_env(extra=None):
     return env
 
 
+def start_detached(cmd, env):
+    """Start the window process so it outlives this script, with no console
+    window on Windows."""
+    if IS_WIN:
+        proc = subprocess.Popen(cmd, env=env, creationflags=NO_WINDOW | 0x00000200,  # new process group
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL)
+        try:
+            # Resolve has the focus; let the new window take it
+            ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
+        except Exception:
+            pass
+        return proc
+    return subprocess.Popen(cmd, env=env, start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def ensure_app_bundle():
-    """Create or repair the Guide Calculator.app wrapper. Returns its
-    executable, or Resolve's Python itself if the wrapper can't be made."""
+    """Create or repair the Guide Calculator.app wrapper (macOS) and return
+    the executable to run. On Windows this is Resolve's Python itself."""
+    if IS_WIN:
+        return RESOLVE_PYTHON
     try:
         if not (APP_EXEC.is_symlink() and os.readlink(APP_EXEC) == RESOLVE_PYTHON):
             APP_EXEC.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +358,8 @@ def launch_window_process():
     resolution read here inside Resolve. Uses a system Python with PySide6 if
     there is one, otherwise Resolve's own Python with a private PySide6,
     downloading that the first time."""
+    if activate_running_instance():
+        return True
     script = find_script_path()
     if not script:
         log("couldn't find GuideCalculator.py in Resolve's Scripts folder.")
@@ -269,17 +378,31 @@ def launch_window_process():
         if not QT_READY_MARKER.exists():
             cmd.append("--install-qt")
     else:
-        log("needs Python 3 with PySide6 (pip3 install PySide6), or "
+        log("needs Python 3 with PySide6 (pip install PySide6), or "
             "DaVinci Resolve 21.1 or later.")
         return False
-    subprocess.Popen(cmd, env=env, start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    start_detached(cmd, env)
     return True
 
 
+def download(url, dest):
+    """Download with curl (built into macOS and Windows 10+), or urllib."""
+    import shutil
+    curl = shutil.which("curl")
+    if curl:
+        r = subprocess.run([curl, "-fsSL", "--retry", "2", "-o", dest, url],
+                           capture_output=True, text=True, timeout=1800,
+                           creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError(f"download failed: {r.stderr.strip()}")
+    else:
+        import urllib.request
+        urllib.request.urlretrieve(url, dest)
+
+
 def install_qt():
-    """Download the pinned PySide6 wheels with curl, check their SHA-256,
-    and unpack them into QT_LIB_DIR. Returns True when it's ready."""
+    """Download the pinned PySide6 wheels for this platform, check their
+    SHA-256, and unpack them into QT_LIB_DIR. Returns True when it's ready."""
     import hashlib
     import shutil
     import tempfile
@@ -300,25 +423,23 @@ def install_qt():
         return install_qt()
 
     try:
-        notify("First run: downloading PySide6 (about 110 MB). "
+        notify("First run: downloading the window's Qt libraries (about 110 MB). "
                "The window opens when it's done.")
         log(f"downloading PySide6 {QT_VERSION} into {QT_LIB_DIR}")
         partial = QT_LIB_DIR.with_name(QT_LIB_DIR.name + ".partial")
         shutil.rmtree(partial, ignore_errors=True)
         with tempfile.TemporaryDirectory() as tmp:
-            for name, url, sha in QT_WHEELS:
+            for name, url, sha in qt_wheels():
                 dest = os.path.join(tmp, name)
-                r = subprocess.run(["curl", "-fsSL", "--retry", "2", "-o", dest, url],
-                                   capture_output=True, text=True, timeout=1800)
-                if r.returncode != 0:
-                    raise RuntimeError(f"download failed for {name}: {r.stderr.strip()}")
+                download(url, dest)
                 h = hashlib.sha256()
                 with open(dest, "rb") as f:
                     for chunk in iter(lambda: f.read(1 << 20), b""):
                         h.update(chunk)
                 if h.hexdigest() != sha:
                     raise RuntimeError(f"{name} didn't match its published checksum")
-                zipfile.ZipFile(dest).extractall(partial)
+                with zipfile.ZipFile(dest) as z:
+                    z.extractall(partial)
         shutil.rmtree(QT_LIB_DIR, ignore_errors=True)
         partial.rename(QT_LIB_DIR)
         QT_READY_MARKER.write_text(QT_VERSION)
@@ -336,15 +457,49 @@ def install_qt():
 
 
 def install_qt_and_relaunch(argv):
-    """Runs in Resolve's Python on first launch: install PySide6, then
-    replace this process with the window."""
+    """Runs in Resolve's Python on first launch: install PySide6, then open
+    the window (replacing this process on macOS)."""
     if not install_qt():
         return
     notify("Ready. Opening Guide Calculator.")
     args = [a for a in argv[1:] if a != "--install-qt"]
     exe = ensure_app_bundle()
-    os.execve(exe, [exe, find_script_path()] + args,
-              child_env({QT_LIB_ENV: str(QT_LIB_DIR)}))
+    env = child_env({QT_LIB_ENV: str(QT_LIB_DIR)})
+    if IS_WIN:
+        start_detached([exe, find_script_path()] + args, env)
+    else:
+        os.execve(exe, [exe, find_script_path()] + args, env)
+
+
+# ── one window at a time ──────────────────────────────────────────────────────
+# The open window listens on a localhost port and records it, with a random
+# token, in INSTANCE_FILE. A second launch hands focus to that window instead
+# of opening another one.
+
+INSTANCE_FILE = DATA_DIR / "instance.json"
+
+
+def activate_running_instance():
+    """Ask an already-open calculator window to come to the front.
+    Returns True if one answered."""
+    import socket
+    try:
+        info = json.loads(INSTANCE_FILE.read_text())
+        port, token, pid = int(info["port"]), str(info["token"]), int(info["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if IS_WIN:
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(pid)
+        except Exception:
+            pass
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.5) as s:
+            s.sendall((token + "\n").encode())
+            s.settimeout(1.5)
+            return s.recv(16).startswith(b"ok")
+    except OSError:
+        return False
 
 
 def parse_size_args(argv):
@@ -358,6 +513,10 @@ def parse_size_args(argv):
 
 
 # ── sending guides to Resolve ─────────────────────────────────────────────────
+
+# Send guides and Clear drive Resolve's menus with AppleScript and macOS mouse
+# events. Windows would need UI Automation instead, which isn't built yet.
+SEND_SUPPORTED = sys.platform == "darwin"
 # The scripting API has no access to viewer guides, but Resolve's View > Guides
 # menu has Add Guide… and Clear All Guides. These helpers drive that menu and
 # the Add Guide dialog through macOS accessibility (System Events) plus one
@@ -1405,6 +1564,16 @@ class GuideCalculator(QWidget):
         self.replace_check = QCheckBox("Replace existing guides")
         self.replace_check.setChecked(True)
         col.addWidget(self.replace_check)
+        if not SEND_SUPPORTED:
+            self.send_btn.setEnabled(False)
+            self.clear_btn.setEnabled(False)
+            self.replace_check.hide()
+            note = QLabel("Sending guides to Resolve is macOS-only for now. Copy the "
+                          "values and add them with View › Guides › Add Guide.")
+            note.setObjectName("dim")
+            note.setWordWrap(True)
+            note.setStyleSheet("font-size: 11px;")
+            col.addWidget(note)
         return side
 
     def _build_guide_list(self, col, title, axis):
@@ -1615,8 +1784,9 @@ class GuideCalculator(QWidget):
             lst.addItem(item)
 
     def _set_copy_enabled(self, on):
-        for btn in (self.copy_all_btn, self.copy_vert_btn, self.copy_horiz_btn, self.send_btn):
+        for btn in (self.copy_all_btn, self.copy_vert_btn, self.copy_horiz_btn):
             btn.setEnabled(on)
+        self.send_btn.setEnabled(on and SEND_SUPPORTED)
 
     # ── clipboard & export ────────────────────────────────────────────────────
 
@@ -1736,10 +1906,21 @@ class GuideCalculator(QWidget):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def bring_forward(self):
+        """Show, raise and focus this window, even from behind Resolve."""
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        bring_app_to_front(self)
+
     def _on_automation_finished(self, ok, msg, needs_permission):
         self.clear_btn.setEnabled(True)
         self.send_btn.setEnabled(self._last_w is not None)
         self._set_status(msg, ok=ok, error=not ok)
+        # Sending activates Resolve; come back so the next change is one click away
+        self.bring_forward()
         if needs_permission:
             self.raise_()
             self.activateWindow()
@@ -1767,10 +1948,17 @@ class GuideCalculator(QWidget):
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
-def bring_app_to_front():
-    """Make this process the active app. Resolve's own Python is a plain
-    executable rather than an app bundle, so its window otherwise opens
-    behind Resolve."""
+def bring_app_to_front(win):
+    """Make this process the active app. On macOS, Resolve's own Python is a
+    plain executable rather than an app bundle, so its window otherwise opens
+    behind Resolve. On Windows the launcher allowed this process to take the
+    foreground, so ask for it directly."""
+    if sys.platform.startswith("win"):
+        try:
+            ctypes.windll.user32.SetForegroundWindow(int(win.winId()))
+        except Exception:
+            pass
+        return
     try:
         objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
         objc.objc_getClass.restype = ctypes.c_void_p
@@ -1787,6 +1975,72 @@ def bring_app_to_front():
         pass
 
 
+def use_dark_title_bar(win):
+    """Windows 10/11 draw a light title bar unless asked; match the dark UI."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        hwnd = ctypes.c_void_p(int(win.winId()))
+        on = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (20; 19 on older builds)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                break
+    except Exception:
+        pass
+
+
+def start_instance_server(win):
+    """Listen for later launches and bring this window forward when one
+    knocks with the right token. Returns the server (keep a reference)."""
+    import secrets
+    from PySide6.QtNetwork import QTcpServer, QHostAddress
+    token = secrets.token_hex(16)
+    server = QTcpServer(win)
+    if not server.listen(QHostAddress(QHostAddress.LocalHost), 0):
+        return None
+
+    def on_connection():
+        sock = server.nextPendingConnection()
+        if sock is None:
+            return
+        ok = sock.waitForReadyRead(1000) and bytes(sock.readLine()).decode(errors="ignore").strip() == token
+        if ok:
+            sock.write(b"ok\n")
+            sock.flush()
+            sock.waitForBytesWritten(500)
+            win.bring_forward()
+        sock.disconnectFromHost()
+        sock.deleteLater()
+
+    server.newConnection.connect(on_connection)
+    try:
+        INSTANCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INSTANCE_FILE.write_text(json.dumps({"port": server.serverPort(), "token": token, "pid": os.getpid()}))
+    except OSError:
+        pass
+
+    def forget():
+        try:
+            if json.loads(INSTANCE_FILE.read_text()).get("pid") == os.getpid():
+                INSTANCE_FILE.unlink()
+        except (OSError, ValueError):
+            pass
+
+    QApplication.instance().aboutToQuit.connect(forget)
+    return server
+
+
+def qt_plugin_dir():
+    """Qt's plugins folder inside this PySide6 (Qt/plugins on macOS,
+    plugins on Windows)."""
+    import PySide6
+    base = os.path.dirname(PySide6.__file__)
+    for d in (os.path.join(base, "Qt", "plugins"), os.path.join(base, "plugins")):
+        if os.path.isdir(d):
+            return d
+    return None
+
+
 def main():
     if inside_resolve():
         launch_window_process()
@@ -1795,22 +2049,27 @@ def main():
         install_qt_and_relaunch(sys.argv)
         return
     if not HAVE_QT:
-        print("GuideCalculator needs PySide6: pip3 install PySide6")
+        print("GuideCalculator needs PySide6: pip install PySide6")
         return
     # Resolve's Python can't find Qt's plugins on its own, so point Qt at the
     # ones that ship with this PySide6 before the app starts.
-    import PySide6
     from PySide6.QtCore import QCoreApplication
-    QCoreApplication.setLibraryPaths([os.path.join(os.path.dirname(PySide6.__file__), "Qt", "plugins")])
+    plugins = qt_plugin_dir()
+    if plugins:
+        QCoreApplication.setLibraryPaths([plugins])
+    if activate_running_instance():
+        return  # a window is already open; it has been brought forward
     app = QApplication.instance() or QApplication([])
     apply_dark_theme(app)
     win = GuideCalculator(parse_size_args(sys.argv))
     win.resize(1120, 720)
+    use_dark_title_bar(win)
+    win._instance_server = start_instance_server(win)  # keep it alive with the window
     win.show()
     win.raise_()
     win.activateWindow()
     for delay in (0, 300, 900):  # the window can take a moment to appear
-        QTimer.singleShot(delay, bring_app_to_front)
+        QTimer.singleShot(delay, lambda: bring_app_to_front(win))
     app.exec()
 
 
